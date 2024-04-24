@@ -16,6 +16,44 @@
     overlays.default = (final: prev: {
       twitch-archiver = self.packages.${final.system}.twitch-archiver;
     });
+    nixosModules.default = { config, lib, pkgs, ... }:
+      with lib;
+      let
+        cfg = config.services.twitch-archiver;
+        channels = concatStringsSep " " cfg.channels;
+      in
+      {
+        options.services.twitch-archiver = {
+          enable = mkEnableOption {
+            description = "Enable the twitch-archiver, a small service to archive Twitch chat logs";
+          };
+          channels = mkOption {
+            description = "A list of channels to connect to and archive";
+            type = types.listOf types.str;
+          };
+          rotationLimit = mkOption {
+            description = "";
+            type = types.number;
+            default = 134217728;
+          };
+        };
+
+        config = {
+          nixpkgs.overlays = [ self.overlays.default ];
+          systemd.services.twitch-archiver = mkIf cfg.enable {
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network.target" ];
+            serviceConfig = {
+              Restart = "on-failure";
+              RestartSec = "1s";
+              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver ${channels} -o /var/lib/twitch-archiver/twitch.log";
+              DynamicUser = "yes";
+              StateDirectory = "twitch-archiver";
+              StateDirectoryMode = "0755";
+            };
+          };
+        };
+      };
   } //
   (flake-utils.lib.eachDefaultSystem (system:
     let
