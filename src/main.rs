@@ -118,10 +118,8 @@ fn compress(msg: &mut Message) {
         }
     };
 
-    // we want to keep room-id for ROOMSTATE, it has no nonce
-    // and we're keeping sometag=0 stuff for idempotency
-    // also roomstate updates happen once in a blue moon anyway lol
-    if msg.command == "ROOMSTATE" {
+    // the absolute majority of commands are PRIVMSG so we "compress" only those
+    if msg.command != "PRIVMSG" {
         return;
     }
     msg.tags.retain_mut(|(k, v)| {
