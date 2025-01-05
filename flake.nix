@@ -97,7 +97,6 @@
           ];
 
           cargoLock.lockFile = ./Cargo.lock;
-          useNextest = true;
 
           nativeBuildInputs = [ ];
           buildInputs = [ ] ++ darwinDeps;
