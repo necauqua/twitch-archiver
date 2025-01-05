@@ -1,14 +1,14 @@
 [package]
 name = 'twitch-archiver'
-version = '0.1.0'
+version = '0.1.1'
 authors = ['Anton Bulakh <him@necauq.ua>']
 edition = '2021'
 
 [dependencies]
 anyhow = { version = '1', features = ['backtrace'] }
-base64 = '0.22.0'
-clap = { version = '4.5.4', features = ['derive'] }
-file-rotate = '0.7.5'
-smallvec = '1.13'
-tcp-stream = '0.27'
-uuid = "1.8.0"
+base64 = '0.22'
+clap = { version = '4', features = ['derive'] }
+file-rotate = '0.7'
+smallvec = '1'
+tcp-stream = '0.29'
+uuid = '1'
