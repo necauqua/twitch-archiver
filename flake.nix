@@ -74,7 +74,7 @@
             pkgs.lib.all (re: builtins.match re relPath == null) regexes;
         };
 
-      rust-version = pkgs.rust-bin.stable."1.77.2".default;
+      rust-version = pkgs.rust-bin.stable.latest.default;
 
       ourRustPlatform = pkgs.makeRustPlatform {
         rustc = rust-version;
