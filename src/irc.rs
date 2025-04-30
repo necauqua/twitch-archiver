@@ -7,7 +7,7 @@ use std::io::Write;
 #[derive(Debug)]
 pub struct TagValue<'m>(pub Cow<'m, str>);
 
-impl<'m> TagValue<'m> {
+impl TagValue<'_> {
     pub fn unescape(&self) -> Cow<str> {
         if let Cow::Owned(ref s) = self.0 {
             return Cow::Borrowed(s);
@@ -52,7 +52,7 @@ impl<'m> TagValue<'m> {
     }
 }
 
-impl<'m> Display for TagValue<'m> {
+impl Display for TagValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.unescape())
     }

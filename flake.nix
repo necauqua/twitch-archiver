@@ -33,7 +33,28 @@
           rotationLimit = mkOption {
             description = "";
             type = types.number;
-            default = 134217728;
+            default = 16777216;
+          };
+          elastic = mkOption {
+            description = "ElasticSearch configuration";
+            type = types.nullOr (types.submodule {
+              options = {
+                url = mkOption {
+                  description = "The ElasticSearch url";
+                  type = types.str;
+                  default = "http://localhost:9200";
+                };
+                index = mkOption {
+                  description = "The ElasticSearch index to send messages to";
+                  type = types.str;
+                  default = "twitch-logs";
+                };
+                apiKeyFile = mkOption {
+                  description = "Path to the file containing the ElasticSearch API key";
+                  type = types.path;
+                };
+              };
+            });
           };
         };
 
@@ -45,7 +66,12 @@
             serviceConfig = {
               Restart = "on-failure";
               RestartSec = "1s";
-              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver ${channels} -o /var/lib/twitch-archiver/twitch.log";
+              ExecStart = let
+                subcmd =
+                  if cfg.elastic != null then
+                    ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" "${cfg.elastic.index}"''
+                  else "irc /var/lib/twitch-archiver/twitch.log";
+              in "${pkgs.twitch-archiver}/bin/twitch-archiver -c ${channels} ${subcmd}";
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";

@@ -1,14 +1,24 @@
 [package]
 name = 'twitch-archiver'
-version = '0.1.1'
+version = '0.2.0'
 authors = ['Anton Bulakh <him@necauq.ua>']
 edition = '2021'
 
 [dependencies]
+neca-cmd = '0.1'
+
 anyhow = { version = '1', features = ['backtrace'] }
 base64 = '0.22'
+chrono = '0.4'
 clap = { version = '4', features = ['derive'] }
 file-rotate = '0.7'
+rustls = { version = '0.23', default-features = false, features = ['ring'] }
+serde = { version = '1', features = ['derive'] }
+serde_json = { version = '1', features = ['preserve_order'] }
+serde_with = '3'
 smallvec = '1'
-tcp-stream = '0.29'
-uuid = '1'
+tcp-stream = { version = '0.29', features = ['rustls--ring'] }
+tracing = { version = '0.1', features = ['log'] }
+tracing-subscriber = { version = '0.3', features = ['env-filter'] }
+ureq = { version = '3', features = ['json'] }
+uuid = { version = '1', features = ['v4'] }
