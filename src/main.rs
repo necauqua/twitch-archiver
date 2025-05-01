@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use base64::Engine;
 use chrono::Utc;
 use clap::Parser;
 use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
@@ -32,6 +33,8 @@ enum OutputFormat {
         /// If not specified, logs will be written to stdout.
         #[arg()]
         file: Option<PathBuf>,
+        /// The size (in bytes) that has to be surpassed for the file to be rotated
+        /// Default value is 16 MiB (2^24 bytes)
         #[arg(long)]
         rotation_limit: Option<usize>,
     },
@@ -42,6 +45,8 @@ enum OutputFormat {
         /// If not specified, logs will be written to stdout.
         #[arg()]
         file: Option<PathBuf>,
+        /// The size (in bytes) that has to be surpassed for the file to be rotated
+        /// Default value is 16 MiB (2^24 bytes)
         #[arg(long)]
         rotation_limit: Option<usize>,
     },
@@ -60,7 +65,7 @@ enum OutputFormat {
 }
 
 #[derive(Parser)]
-struct Args {
+struct ArchiveArgs {
     /// The channels to read from
     #[arg(short, long)]
     channels: Vec<String>,
@@ -71,8 +76,6 @@ struct Args {
     /// "oauth:$OAUTH_TOKEN" here
     #[arg(short, long)]
     pass: Option<String>,
-    /// The size (in bytes) that has to be surpassed for the file to be rotated
-    /// Default value is 16 MiB (2^24 bytes)
     /// Dont filter out any messages (except PING).
     /// By default, Twitch server welcome messages and JOIN/PART are filtered
     /// away
@@ -85,7 +88,34 @@ struct Args {
     output: OutputFormat,
 }
 
-fn connect(args: &Args) -> Result<TcpStream> {
+#[derive(Parser)]
+struct BackfillArgs {
+    /// The file to read IRC logs from (stdin by default)
+    input: Option<PathBuf>,
+    /// The file pattern to write Elastic bulk ndjson to.
+    /// `%` in the given string is replaced with the chunk index.
+    #[arg(default_value = "backfill-%.ndjson")]
+    output: String,
+    /// The Elastic index target for the backfilling.
+    #[arg(long, default_value = "twitch-logs")]
+    index: String,
+    /// Dont filter out any messages (except PING).
+    /// By default, Twitch server welcome messages and JOIN/PART are filtered
+    /// away
+    #[arg(long)]
+    dont_filter: bool,
+    /// The size (in bytes) of chunks to split the output into.
+    #[arg(long)]
+    chunk_size: Option<usize>,
+}
+
+#[derive(Parser)]
+enum Args {
+    Archive(ArchiveArgs),
+    Backfill(BackfillArgs),
+}
+
+fn connect(args: &ArchiveArgs) -> Result<TcpStream> {
     let addr = ("irc.chat.twitch.tv", 6697);
     let stream = TcpStream::connect(addr)?;
     let mut stream = stream.into_tls(addr.0, TLSConfig::default());
@@ -114,7 +144,20 @@ fn connect(args: &Args) -> Result<TcpStream> {
 }
 
 const IGNORED_CMDS: &[&str] = &[
-    "366", "001", "002", "003", "004", "375", "372", "376", "CAP", "353",
+    "001",
+    "002",
+    "003",
+    "004",
+    "353",
+    "366",
+    "372",
+    "375",
+    "376",
+    "CAP",
+    "JOIN",
+    "PONG",
+    "PING",
+    "RECONNECT",
 ];
 
 trait LogOutput {
@@ -182,16 +225,20 @@ impl LogOutput for ElasticLogOutput {
 
         let res = self.client.post(&endpoint).send(&body)?;
 
-        if !res.status().is_success() && res.status() != StatusCode::CONFLICT {
-            tracing::error!(
-                id,
-                message = body,
-                "Failed to send log to ES (status {}): {}",
-                res.status(),
-                res.into_body()
-                    .read_to_string()
-                    .unwrap_or_else(|_| "<failed to read response body>".into())
-            );
+        if !res.status().is_success() {
+            if res.status() == StatusCode::CONFLICT {
+                tracing::info!(id, "Message already exists in ES");
+            } else {
+                tracing::error!(
+                    id,
+                    message = body,
+                    "Failed to send log to ES (status {}): {}",
+                    res.status(),
+                    res.into_body()
+                        .read_to_string()
+                        .unwrap_or_else(|_| "<failed to read response body>".into())
+                );
+            };
         }
         Ok(())
     }
@@ -210,45 +257,33 @@ fn compress(msg: &mut Message) {
         }
     };
 
-    // the absolute majority of commands are PRIVMSG so we "compress" only those
-    if msg.command != "PRIVMSG" {
-        return;
-    }
     msg.tags.retain_mut(|(k, v)| {
-        // room-id: ROOMSTATE gives room id for channel, and messages have channels
         // client-nonce: useless nonce that takes up 46 bytes total
         // emotes: they are still in the text, and we wont get extra metadata
         // for 7tv/ffz/bttv/etc ones anyway
         // (emotes tag only contains byteranges and emote cdn ids)
-        if k == &"room-id" || k == &"client-nonce" || k == &"emotes" {
+        // display-name: redundant if equal to nick
+        if k == &"client-nonce" || k == &"emotes" || k == &"display-name" && &**v == nick {
             return false;
         }
-        // remove the display-name if it does nothing
-        // (if it needed escaping it's not equal to the nick lol)
-        if k == &"display-name" && nick == v.0 {
-            return false;
-        }
-
-        // cleanup all the tags whose absence and empty value or 0 are equivalent
-        // (@badge-info=;color=;emotes=;first-msg=0;flags=;mod=0;returning-chatter=0;subscriber=0;turbo=0;user-type=)
-        // etc
-        !v.0.is_empty() && v.0 != "0"
+        // otherwise just cleanup empty tags
+        !v.is_empty()
     });
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(serde::Serialize)]
-struct Json<'a> {
+struct Json {
     #[serde(rename = "_id")]
     id: Option<String>,
     #[serde(rename = "@timestamp")]
     timestamp: i64,
-    channel: Option<&'a str>,
+    channel: Option<String>,
     name: Option<String>,
-    message: Option<&'a str>,
+    message: Option<String>,
     tags: serde_json::Map<String, Value>,
     #[serde(rename = "irc.nick")]
-    irc_nick: Option<&'a str>,
+    irc_nick: Option<String>,
     #[serde(rename = "irc.cmd")]
     irc_cmd: String,
     #[serde(rename = "irc.extras", skip_serializing_if = "Vec::is_empty")]
@@ -259,7 +294,7 @@ struct Json<'a> {
     commands_count: Option<NonZero<u32>>,
 }
 
-fn to_json<'m>(message: &'m Message) -> Json<'m> {
+fn to_json(message: &Message) -> Json {
     let mut tags = serde_json::Map::new();
 
     let mut id = None;
@@ -273,7 +308,11 @@ fn to_json<'m>(message: &'m Message) -> Json<'m> {
                 .split(",")
                 .map(|b| {
                     let (k, v) = b.split_once("/").unwrap_or((b, ""));
-                    (k.to_owned(), v.to_owned().into())
+                    let v = match v.parse::<i64>() {
+                        Ok(v) => Value::Number(v.into()),
+                        Err(_) => Value::String(v.to_owned()),
+                    };
+                    (k.to_owned(), v)
                 })
                 .collect();
 
@@ -282,10 +321,12 @@ fn to_json<'m>(message: &'m Message) -> Json<'m> {
             id = Some(v.unescape().to_string());
         } else if k == "tmi-sent-ts" {
             timestamp = Some(v.unescape().to_string());
-        } else if v.0 == "1" {
-            tags.insert(k, Value::Bool(true));
         } else {
-            tags.insert(k, v.unescape().into());
+            let v = match v.unescape().parse::<i64>() {
+                Ok(v) => Value::Number(v.into()),
+                Err(_) => Value::String((*v).to_owned()),
+            };
+            tags.insert(k, v);
         }
     }
 
@@ -299,15 +340,31 @@ fn to_json<'m>(message: &'m Message) -> Json<'m> {
         Value::String(s) => s,
         _ => unreachable!(),
     });
-    let irc_nick = message.prefix.as_ref().map(|p| p.nick);
-    let name = display_name.as_deref().or(irc_nick).map(|s| s.to_owned());
+    let irc_nick = message.prefix.as_ref().map(|p| p.nick.to_owned());
+    let name = display_name.or_else(|| irc_nick.clone());
 
     let irc_cmd = message.command.to_owned();
-    let channel = message.params.first().and_then(|m| m.strip_prefix("#"));
-    let text = message.params.get(1).copied();
+    let channel = message
+        .params
+        .first()
+        .and_then(|m| m.strip_prefix("#"))
+        .map(|s| s.to_owned());
+    let text = message.params.get(1).map(|&s| s.to_owned());
+
+    let text = text
+        .or_else(|| {
+            tags.get("system-msg")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+        })
+        .or_else(|| {
+            tags.get("msg-id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned())
+        });
 
     let (commands_count, commands_only) = (irc_cmd == "PRIVMSG")
-        .then_some(text)
+        .then_some(text.as_deref())
         .flatten()
         .map(|msg| {
             let commands = CommandMessage::parse(msg);
@@ -341,39 +398,6 @@ fn to_json<'m>(message: &'m Message) -> Json<'m> {
     }
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| anyhow!("Failed to install crypto provider"))?;
-
-    let args = Args::parse();
-
-    let mut backoff = Duration::ZERO;
-    loop {
-        let result = run(&args, &mut backoff);
-        tracing::info!(
-            "disconnected from twitch, waiting for {} seconds and retrying, result was {result:?}",
-            backoff.as_secs()
-        );
-        if backoff == Duration::ZERO {
-            backoff = Duration::from_secs(1);
-            continue;
-        }
-        std::thread::sleep(backoff);
-        backoff *= 2;
-        if backoff.as_secs() > 32 {
-            bail!("backoff retries failed")
-        }
-    }
-}
-
 fn rotate(path: &Option<PathBuf>, rotation_limit: Option<usize>) -> FileRotate<AppendCount> {
     FileRotate::new(
         path.clone().unwrap_or_else(|| "twitch.log".into()),
@@ -384,7 +408,7 @@ fn rotate(path: &Option<PathBuf>, rotation_limit: Option<usize>) -> FileRotate<A
     )
 }
 
-fn run(args: &Args, backoff: &mut Duration) -> Result<()> {
+fn run(args: &ArchiveArgs, backoff: &mut Duration) -> Result<()> {
     let mut output: Box<dyn LogOutput> = match &args.output {
         OutputFormat::Irc { file: None, .. } => Box::new(IrcLogOutput(std::io::stdout())),
         OutputFormat::Json { file: None, .. } => Box::new(JsonLogOutput(std::io::stdout())),
@@ -417,6 +441,8 @@ fn run(args: &Args, backoff: &mut Duration) -> Result<()> {
         if msg.command == "PING" {
             let reply = msg.params.first().unwrap_or(&"");
             write!(reader.get_mut(), "PONG :{reply}\r\n")?;
+        } else if msg.command == "RECONNECT" {
+            bail!("received reconnect request");
         } else if args.dont_filter || !IGNORED_CMDS.contains(&msg.command) {
             compress(&mut msg);
             output.write(&msg)?;
@@ -425,4 +451,97 @@ fn run(args: &Args, backoff: &mut Duration) -> Result<()> {
         buffer.clear();
     }
     Ok(())
+}
+
+fn archive(args: ArchiveArgs) -> Result<()> {
+    let mut backoff = Duration::ZERO;
+    loop {
+        let result = run(&args, &mut backoff);
+        tracing::info!(
+            "disconnected from twitch, waiting for {} seconds and retrying, result was {result:?}",
+            backoff.as_secs()
+        );
+        if backoff == Duration::ZERO {
+            backoff = Duration::from_secs(1);
+            continue;
+        }
+        std::thread::sleep(backoff);
+        backoff *= 2;
+        if backoff.as_secs() > 32 {
+            bail!("backoff retries failed")
+        }
+    }
+}
+
+fn backfill(args: BackfillArgs) -> Result<()> {
+    let input: Box<dyn BufRead> = match args.input {
+        Some(path) => Box::new(BufReader::new(std::fs::File::open(path)?)),
+        None => Box::new(std::io::stdin().lock()),
+    };
+    let chunk_size = args.chunk_size.unwrap_or(usize::MAX);
+
+    let mut s = String::with_capacity(1024 * 1024);
+    let mut idx = 0;
+
+    for line in input.lines() {
+        let line = line?;
+        let mut message = Message::parse(&line);
+
+        if !args.dont_filter && IGNORED_CMDS.contains(&message.command) {
+            continue;
+        }
+        // we cant backfill messages without a timestamp
+        if !message.tags.iter().all(|(k, _)| *k != "tmi-sent-ts") {
+            continue;
+        }
+
+        compress(&mut message);
+        let mut json = to_json(&message);
+
+        let id = json.id.take().unwrap();
+        let id = if id.len() == 36 {
+            id
+        } else {
+            // hangle old logs where we did that
+            Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(id)?)?.to_string()
+        };
+
+        let mut appending = serde_json::to_string(&serde_json::json!({
+            "create": {
+                "_index": args.index,
+                "_id": id,
+            }
+        }))?;
+        appending.push_str(&serde_json::to_string(&json)?);
+
+        if s.len() + appending.len() >= chunk_size {
+            let path = args.output.replace("%", &idx.to_string());
+            std::fs::write(path, std::mem::take(&mut s))?;
+            idx += 1;
+        }
+        s.push_str(&appending);
+    }
+    if !s.is_empty() {
+        let path = args.output.replace("%", &idx.to_string());
+        std::fs::write(path, std::mem::take(&mut s))?;
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("Failed to install crypto provider"))?;
+
+    match Args::parse() {
+        Args::Archive(args) => archive(args),
+        Args::Backfill(args) => backfill(args),
+    }
 }

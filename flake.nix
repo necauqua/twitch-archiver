@@ -71,7 +71,7 @@
                   if cfg.elastic != null then
                     ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" "${cfg.elastic.index}"''
                   else "irc /var/lib/twitch-archiver/twitch.log";
-              in "${pkgs.twitch-archiver}/bin/twitch-archiver -c ${channels} ${subcmd}";
+              in "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";

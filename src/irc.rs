@@ -2,6 +2,7 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt::{self, Display};
 use std::io::Write;
+use std::ops::Deref;
 
 #[repr(transparent)]
 #[derive(Debug)]
@@ -49,6 +50,14 @@ impl TagValue<'_> {
             }
         }
         Cow::Owned(owned)
+    }
+}
+
+impl Deref for TagValue<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
