@@ -323,9 +323,14 @@ fn to_json(message: &Message) -> Json {
         } else if k == "tmi-sent-ts" {
             timestamp = Some(v.unescape().to_string());
         } else {
-            let v = match v.unescape().parse::<i64>() {
-                Ok(v) => Value::Number(v.into()),
-                Err(_) => Value::String((*v).to_owned()),
+            // those twitch ids are numeric, but I want to store them as strings to avoid a 2bil issue idk
+            let v = if k != "user-id" && k != "room-id" {
+                match v.unescape().parse::<i64>() {
+                    Ok(v) => Value::Number(v.into()),
+                    Err(_) => Value::String((*v).to_owned()),
+                }
+            } else {
+                Value::String(v.unescape().to_string())
             };
             tags.insert(k, v);
         }
