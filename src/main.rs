@@ -201,6 +201,7 @@ impl ElasticLogOutput {
         let auth_header = HeaderValue::from_str(&format!("ApiKey {key}")).unwrap();
 
         let client = ureq::Agent::config_builder()
+            .http_status_as_error(false)
             .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
                 req.headers_mut()
                     .append("Authorization", auth_header.clone());
