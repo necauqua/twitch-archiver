@@ -276,9 +276,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.20"
+version = "1.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04da6a0d40b948dfc4fa8f5bbf402b0fc1a64a28dbf7d12ffd683550f2c1b63a"
+checksum = "8691782945451c1c383942c4874dbe63814f61cb57ef773cda2972682b7bb3c0"
 dependencies = [
  "jobserver",
  "libc",
@@ -1139,9 +1139,9 @@ dependencies = [
 
 [[package]]
 name = "neca-cmd"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f446fe1009d1c805696c76233c45a7c3e07436544a225fef4164015292463456"
+checksum = "6332f539683d8d2ecc6720fa8577903619cd11075c617408f428d398eb3395b7"
 dependencies = [
  "lazy-regex",
 ]
