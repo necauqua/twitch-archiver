@@ -325,7 +325,7 @@ fn to_json(message: &Message) -> Json {
         } else {
             let v = v.unescape();
             // those twitch ids are numeric, but I want to store them as strings to avoid a 2bil issue idk
-            let v = if k != "user-id" && k != "room-id" {
+            let v = if k.ends_with("-id") {
                 match v.parse::<i64>() {
                     Ok(v) => Value::Number(v.into()),
                     Err(_) => Value::String(v.into_owned()),
@@ -498,19 +498,37 @@ fn backfill(args: BackfillArgs) -> Result<()> {
             continue;
         }
         // we cant backfill messages without a timestamp
-        if !message.tags.iter().all(|(k, _)| *k != "tmi-sent-ts") {
+        if message.tags.iter().all(|(k, _)| *k != "tmi-sent-ts") {
+            continue;
+        }
+        // *especially* without an id
+        if message.tags.iter().all(|(k, _)| *k != "id") {
             continue;
         }
 
         compress(&mut message);
+
+        // fixup old logs that base64-compressed uuids like that
+        for (k, v) in &mut message.tags {
+            if v.len() != 36 && (*k == "reply-parent-msg-id" || *k == "reply-thread-parent-msg-id")
+            {
+                *v = irc::TagValue(
+                    Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(&**v)?)?
+                        .to_string()
+                        .into(),
+                );
+            }
+        }
+
         let mut json = to_json(&message);
 
         let id = json.id.take().unwrap();
-        let id = if id.len() == 36 {
-            id
-        } else {
-            // hangle old logs where we did that
+
+        // same as above
+        let id = if id.len() != 36 {
             Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(id)?)?.to_string()
+        } else {
+            id
         };
 
         let mut appending = serde_json::to_string(&serde_json::json!({
@@ -519,7 +537,9 @@ fn backfill(args: BackfillArgs) -> Result<()> {
                 "_id": id,
             }
         }))?;
+        appending.push('\n');
         appending.push_str(&serde_json::to_string(&json)?);
+        appending.push('\n');
 
         if s.len() + appending.len() >= chunk_size {
             let path = args.output.replace("%", &idx.to_string());

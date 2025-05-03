@@ -1,11 +1,11 @@
 [package]
 name = 'twitch-archiver'
-version = '0.2.0'
+version = '0.2.1'
 authors = ['Anton Bulakh <him@necauq.ua>']
 edition = '2021'
 
 [dependencies]
-neca-cmd = '0.2'
+neca-cmd = '0.2.1'
 
 anyhow = { version = '1', features = ['backtrace'] }
 base64 = '0.22'

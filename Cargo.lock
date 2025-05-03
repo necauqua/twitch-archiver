@@ -1139,9 +1139,9 @@ dependencies = [
 
 [[package]]
 name = "neca-cmd"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6332f539683d8d2ecc6720fa8577903619cd11075c617408f428d398eb3395b7"
+checksum = "72c234c82f44c9e530803059fad3c6090b247a1a3286024deb3be1d44e23b8a7"
 dependencies = [
  "lazy-regex",
 ]
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "twitch-archiver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64",
