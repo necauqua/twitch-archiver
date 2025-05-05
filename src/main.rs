@@ -326,12 +326,12 @@ fn to_json(message: &Message) -> Json {
             let v = v.unescape();
             // those twitch ids are numeric, but I want to store them as strings to avoid a 2bil issue idk
             let v = if k.ends_with("-id") {
+                Value::String(v.into_owned())
+            } else {
                 match v.parse::<i64>() {
                     Ok(v) => Value::Number(v.into()),
                     Err(_) => Value::String(v.into_owned()),
                 }
-            } else {
-                Value::String(v.into_owned())
             };
             tags.insert(k, v);
         }
