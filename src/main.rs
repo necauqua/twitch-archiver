@@ -1,28 +1,29 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use clap::Parser;
 use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, FileRotate};
-use irc::Message;
 use neca_cmd::CommandMessage;
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     num::NonZero,
     path::PathBuf,
-    time::Duration,
 };
-use tcp_stream::{HandshakeError, TLSConfig, TcpStream};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use twitch_irc::{
+    login::StaticLoginCredentials,
+    message::{AsRawIRC, IRCMessage, IRCPrefix},
+    ClientConfig, SecureTCPTransport, TwitchIRCClient,
+};
 use ureq::{
     http::{HeaderValue, Request, StatusCode},
     middleware::MiddlewareNext,
     SendBody,
 };
 use uuid::Uuid;
-
-mod irc;
 
 #[derive(Parser, Clone)]
 enum OutputFormat {
@@ -58,9 +59,12 @@ enum OutputFormat {
         /// The file containing the API key to use for authentication.
         #[arg()]
         api_key_file: String,
-        /// The index to index messages into.
-        #[arg()]
-        index: String,
+        /// The indices to index messages into. If one is given (the minimum
+        /// requirement), all messages are indexed into that with `*` symbol
+        /// being replaced by the channel, otherwise a 1-to-1 mapping of
+        /// channels to indices is used.
+        #[arg(required = true, num_args = 1..)]
+        indices: Vec<String>,
     },
 }
 
@@ -115,61 +119,23 @@ enum Args {
     Backfill(BackfillArgs),
 }
 
-fn connect(args: &ArchiveArgs) -> Result<TcpStream> {
-    let addr = ("irc.chat.twitch.tv", 6697);
-    let stream = TcpStream::connect(addr)?;
-    let mut stream = stream.into_tls(addr.0, TLSConfig::default());
-
-    while let Err(HandshakeError::WouldBlock(mid_handshake)) = stream {
-        stream = mid_handshake.handshake();
-    }
-    let mut stream = stream.unwrap();
-
-    let pass = args.pass.as_deref().unwrap_or("none");
-    let nick = args.nick.as_deref().unwrap_or("justinfan1337");
-
-    write!(stream, "PASS {pass}\r\n")?;
-    write!(stream, "NICK {nick}\r\n")?;
-    write!(stream, "CAP REQ :twitch.tv/tags\r\n")?;
-    write!(stream, "CAP REQ :twitch.tv/commands\r\n")?;
-    if args.dont_filter {
-        write!(stream, "CAP REQ :twitch.tv/membership\r\n")?;
-    }
-    for channel in &args.channels {
-        let channel = channel.to_ascii_lowercase();
-        write!(stream, "JOIN #{channel}\r\n")?;
-    }
-
-    Ok(stream)
-}
-
+#[rustfmt::skip]
 const IGNORED_CMDS: &[&str] = &[
-    "001",
-    "002",
-    "003",
-    "004",
-    "353",
-    "366",
-    "372",
-    "375",
-    "376",
-    "CAP",
-    "JOIN",
-    "PONG",
-    "PING",
-    "RECONNECT",
+    "001", "002", "003", "004",
+    "353", "366", "372", "375", "376",
+    "CAP", "JOIN", "PONG", "PING", "RECONNECT",
 ];
 
 trait LogOutput {
-    fn write(&mut self, message: &Message) -> Result<()>;
+    fn write(&mut self, message: &IRCMessage) -> Result<()>;
 }
 
 struct IrcLogOutput<W>(W);
 
 impl<W: Write> LogOutput for IrcLogOutput<W> {
-    fn write(&mut self, message: &Message) -> Result<()> {
-        message.write(&mut self.0)?;
-        writeln!(&mut self.0)?;
+    fn write(&mut self, message: &IRCMessage) -> Result<()> {
+        self.0.write_all(message.as_raw_irc().as_bytes())?;
+        self.0.write_all(b"\n")?;
         Ok(())
     }
 }
@@ -177,7 +143,7 @@ impl<W: Write> LogOutput for IrcLogOutput<W> {
 struct JsonLogOutput<W>(W);
 
 impl<W: Write> LogOutput for JsonLogOutput<W> {
-    fn write(&mut self, message: &Message) -> Result<()> {
+    fn write(&mut self, message: &IRCMessage) -> Result<()> {
         writeln!(
             &mut self.0,
             "{}",
@@ -189,11 +155,12 @@ impl<W: Write> LogOutput for JsonLogOutput<W> {
 
 struct ElasticLogOutput {
     client: ureq::Agent,
-    endpoint: String,
+    address: String,
+    indices: HashMap<String, String>,
 }
 
 impl ElasticLogOutput {
-    fn new(address: &str, api_key_file: &str, index: &str) -> Self {
+    fn new(address: &str, api_key_file: &str, indices: HashMap<String, String>) -> Self {
         let key = std::fs::read_to_string(api_key_file)
             .expect("Failed to read ES API key from the given file");
         let key = key.trim();
@@ -211,17 +178,33 @@ impl ElasticLogOutput {
             })
             .build()
             .new_agent();
-        let endpoint = format!("{address}/{index}/_create");
-        Self { client, endpoint }
+
+        Self {
+            client,
+            address: address.to_owned(),
+            indices,
+        }
     }
 }
 
 impl LogOutput for ElasticLogOutput {
-    fn write(&mut self, message: &Message) -> Result<()> {
+    fn write(&mut self, message: &IRCMessage) -> Result<()> {
         let mut json = to_json(message);
 
+        let channel = json
+            .channel
+            .as_ref()
+            .with_context(|| format!("No channel in message: {message:?}"))?;
+
+        let index = self
+            .indices
+            .get(channel)
+            .with_context(|| format!("No index mapping for channel {channel}"))?;
+        // ^ should never happen
+
         let id = json.id.take().unwrap();
-        let endpoint = format!("{}/{id}", self.endpoint);
+        let endpoint = format!("{}/{index}/_create/{id}", self.address);
+
         let body = serde_json::to_string(&json)?;
 
         let res = self.client.post(&endpoint).send(&body)?;
@@ -245,30 +228,28 @@ impl LogOutput for ElasticLogOutput {
     }
 }
 
-fn compress(msg: &mut Message) {
+fn compress(msg: &mut IRCMessage) {
     // it's only twitch logins, irc user/host are redundant
-    let nick = match msg.prefix {
-        None => "",
-        Some(ref mut prefix) => {
-            if prefix.host.is_some_and(|h| h.ends_with(".tmi.twitch.tv")) {
-                prefix.host = None;
-                prefix.user = None;
+    let nick = match &mut msg.prefix {
+        None | Some(IRCPrefix::HostOnly { .. }) => "",
+        Some(IRCPrefix::Full { nick, user, host }) => {
+            if host
+                .as_deref()
+                .is_some_and(|h| h.ends_with(".tmi.twitch.tv"))
+            {
+                *host = None;
+                *user = None;
             }
-            prefix.nick
+            nick
         }
     };
-
-    msg.tags.retain_mut(|(k, v)| {
-        // client-nonce: useless nonce that takes up 46 bytes total
-        // emotes: they are still in the text, and we wont get extra metadata
-        // for 7tv/ffz/bttv/etc ones anyway
-        // (emotes tag only contains byteranges and emote cdn ids)
-        // display-name: redundant if equal to nick
-        if k == &"client-nonce" || k == &"emotes" || k == &"display-name" && &**v == nick {
+    msg.tags.0.retain(|k, v| {
+        // client-nonce is a useless nonce that takes up 46 bytes total and display-name is redundant if equal to nick
+        if k == "client-nonce" || k == "display-name" && v.as_deref() == Some(nick) {
             return false;
         }
         // otherwise just cleanup empty tags
-        !v.is_empty()
+        !v.as_deref().is_none_or(|s| s.is_empty())
     });
 }
 
@@ -295,17 +276,17 @@ struct Json {
     commands_count: Option<NonZero<u32>>,
 }
 
-fn to_json(message: &Message) -> Json {
+fn to_json(message: &IRCMessage) -> Json {
     let mut tags = serde_json::Map::new();
 
     let mut id = None;
     let mut timestamp = None;
 
-    for (k, v) in &message.tags {
+    for (k, v) in &message.tags.0 {
         let k = (*k).to_owned();
+        let v = v.as_deref().unwrap_or_default();
         if k == "badges" || k == "badge-info" {
             let data = v
-                .unescape()
                 .split(",")
                 .map(|b| {
                     let (k, v) = b.split_once("/").unwrap_or((b, ""));
@@ -319,18 +300,17 @@ fn to_json(message: &Message) -> Json {
 
             tags.insert(k, Value::Object(data));
         } else if k == "id" {
-            id = Some(v.unescape().to_string());
+            id = Some(v.to_string());
         } else if k == "tmi-sent-ts" {
-            timestamp = Some(v.unescape().to_string());
+            timestamp = Some(v.to_string());
         } else {
-            let v = v.unescape();
             // those twitch ids are numeric, but I want to store them as strings to avoid a 2bil issue idk
             let v = if k.ends_with("-id") {
-                Value::String(v.into_owned())
+                Value::String(v.into())
             } else {
                 match v.parse::<i64>() {
                     Ok(v) => Value::Number(v.into()),
-                    Err(_) => Value::String(v.into_owned()),
+                    Err(_) => Value::String(v.into()),
                 }
             };
             tags.insert(k, v);
@@ -347,16 +327,19 @@ fn to_json(message: &Message) -> Json {
         Value::String(s) => s,
         _ => unreachable!(),
     });
-    let irc_nick = message.prefix.as_ref().map(|p| p.nick.to_owned());
+    let irc_nick = message.prefix.as_ref().map(|p| match p {
+        IRCPrefix::Full { nick, .. } => nick.clone(),
+        IRCPrefix::HostOnly { host } => host.clone(), // should not happen I think?
+    });
     let name = display_name.or_else(|| irc_nick.clone());
 
-    let irc_cmd = message.command.to_owned();
+    let irc_cmd = message.command.clone();
     let channel = message
         .params
         .first()
         .and_then(|m| m.strip_prefix("#"))
         .map(|s| s.to_owned());
-    let text = message.params.get(1).map(|&s| s.to_owned());
+    let text = message.params.get(1).cloned();
 
     let text = text
         .or_else(|| {
@@ -383,12 +366,7 @@ fn to_json(message: &Message) -> Json {
         })
         .unwrap_or_default();
 
-    let irc_extras = message
-        .params
-        .iter()
-        .skip(2)
-        .map(|s| (*s).to_owned())
-        .collect();
+    let irc_extras = message.params.iter().skip(2).cloned().collect();
 
     Json {
         id,
@@ -415,69 +393,65 @@ fn rotate(path: &Option<PathBuf>, rotation_limit: Option<usize>) -> FileRotate<A
     )
 }
 
-fn run(args: &ArchiveArgs, backoff: &mut Duration) -> Result<()> {
-    let mut output: Box<dyn LogOutput> = match &args.output {
+async fn archive(mut args: ArchiveArgs) -> Result<()> {
+    let (mut receiver, client) = TwitchIRCClient::<SecureTCPTransport, _>::new(
+        ClientConfig::new_simple(StaticLoginCredentials::anonymous()),
+    );
+    for channel in &mut args.channels {
+        channel.make_ascii_lowercase();
+        client.join(channel.clone())?;
+    }
+
+    let mut output: Box<dyn LogOutput> = match args.output {
         OutputFormat::Irc { file: None, .. } => Box::new(IrcLogOutput(std::io::stdout())),
         OutputFormat::Json { file: None, .. } => Box::new(JsonLogOutput(std::io::stdout())),
         OutputFormat::Irc {
             file,
             rotation_limit,
-        } => Box::new(IrcLogOutput(rotate(file, *rotation_limit))),
+        } => Box::new(IrcLogOutput(rotate(&file, rotation_limit))),
         OutputFormat::Json {
             file,
             rotation_limit,
-        } => Box::new(JsonLogOutput(rotate(file, *rotation_limit))),
+        } => Box::new(JsonLogOutput(rotate(&file, rotation_limit))),
         OutputFormat::Elastic {
             address,
             api_key_file,
-            index,
-        } => Box::new(ElasticLogOutput::new(address, api_key_file, index)),
+            indices,
+        } => {
+            let mapping = match &indices[..] {
+                [index] => args
+                    .channels
+                    .into_iter()
+                    .map(|ch| {
+                        let index = index.replace("*", &ch);
+                        (ch, index)
+                    })
+                    .collect(),
+                _ => {
+                    if indices.len() != args.channels.len() {
+                        bail!(
+                            "Expected 1 or {} indices, got {}",
+                            args.channels.len(),
+                            indices.len()
+                        );
+                    }
+                    args.channels.into_iter().zip(indices.into_iter()).collect()
+                }
+            };
+
+            Box::new(ElasticLogOutput::new(&address, &api_key_file, mapping))
+        }
     };
 
-    let mut reader = BufReader::new(connect(args)?);
-
-    // reset backoff after successful connection
-    // kinda cringe that this is basically a callback, but oh well, it works
-    *backoff = Duration::ZERO;
-
-    let mut buffer = String::with_capacity(4096);
-    while reader.read_line(&mut buffer)? != 0 {
-        buffer.truncate(buffer.len().saturating_sub(2)); // strip crlf
-        let mut msg = Message::parse(&buffer);
-
-        if msg.command == "PING" {
-            let reply = msg.params.first().unwrap_or(&"");
-            write!(reader.get_mut(), "PONG :{reply}\r\n")?;
-        } else if msg.command == "RECONNECT" {
-            bail!("received reconnect request");
-        } else if args.dont_filter || !IGNORED_CMDS.contains(&msg.command) {
+    while let Some(msg) = receiver.recv().await {
+        let mut msg = msg.source().clone();
+        if args.dont_filter || !IGNORED_CMDS.contains(&&*msg.command) {
             compress(&mut msg);
             output.write(&msg)?;
         }
-        drop(msg);
-        buffer.clear();
     }
-    Ok(())
-}
 
-fn archive(args: ArchiveArgs) -> Result<()> {
-    let mut backoff = Duration::ZERO;
-    loop {
-        let result = run(&args, &mut backoff);
-        tracing::info!(
-            "disconnected from twitch, waiting for {} seconds and retrying, result was {result:?}",
-            backoff.as_secs()
-        );
-        if backoff == Duration::ZERO {
-            backoff = Duration::from_secs(1);
-            continue;
-        }
-        std::thread::sleep(backoff);
-        backoff *= 2;
-        if backoff.as_secs() > 32 {
-            bail!("backoff retries failed")
-        }
-    }
+    Ok(())
 }
 
 fn backfill(args: BackfillArgs) -> Result<()> {
@@ -492,31 +466,35 @@ fn backfill(args: BackfillArgs) -> Result<()> {
 
     for line in input.lines() {
         let line = line?;
-        let mut message = Message::parse(&line);
 
-        if !args.dont_filter && IGNORED_CMDS.contains(&message.command) {
+        let Ok(mut message) = IRCMessage::parse(&line) else {
+            tracing::warn!("Failed to parse line: {line}");
+            continue;
+        };
+
+        if !args.dont_filter && IGNORED_CMDS.contains(&&*message.command) {
             continue;
         }
         // we cant backfill messages without a timestamp
-        if message.tags.iter().all(|(k, _)| *k != "tmi-sent-ts") {
+        if message.tags.0.iter().all(|(k, _)| *k != "tmi-sent-ts") {
             continue;
         }
         // *especially* without an id
-        if message.tags.iter().all(|(k, _)| *k != "id") {
+        if message.tags.0.iter().all(|(k, _)| *k != "id") {
             continue;
         }
 
         compress(&mut message);
 
         // fixup old logs that base64-compressed uuids like that
-        for (k, v) in &mut message.tags {
+        for (k, v) in &mut message.tags.0 {
+            let Some(v) = v.as_mut() else {
+                continue;
+            };
             if v.len() != 36 && (*k == "reply-parent-msg-id" || *k == "reply-thread-parent-msg-id")
             {
-                *v = irc::TagValue(
-                    Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(&**v)?)?
-                        .to_string()
-                        .into(),
-                );
+                *v = Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(&**v)?)?
+                    .to_string();
             }
         }
 
@@ -555,7 +533,8 @@ fn backfill(args: BackfillArgs) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::builder()
@@ -568,7 +547,7 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow!("Failed to install crypto provider"))?;
 
     match Args::parse() {
-        Args::Archive(args) => archive(args),
+        Args::Archive(args) => archive(args).await,
         Args::Backfill(args) => backfill(args),
     }
 }

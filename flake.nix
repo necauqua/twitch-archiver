@@ -45,9 +45,9 @@
                   default = "http://localhost:9200";
                 };
                 index = mkOption {
-                  description = "The ElasticSearch index to send messages to";
-                  type = types.str;
-                  default = "twitch-logs";
+                  description = "The ElasticSearch index or indices to send messages to";
+                  type = types.either types.str (types.listOf types.str);
+                  default = "twitch-chat-*";
                 };
                 apiKeyFile = mkOption {
                   description = "Path to the file containing the ElasticSearch API key";
@@ -66,12 +66,21 @@
             serviceConfig = {
               Restart = "on-failure";
               RestartSec = "1s";
-              ExecStart = let
-                subcmd =
-                  if cfg.elastic != null then
-                    ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" "${cfg.elastic.index}"''
-                  else "irc /var/lib/twitch-archiver/twitch.log";
-              in "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
+              ExecStart =
+                let
+                  subcmd =
+                    if cfg.elastic != null then
+                      let
+                        indices =
+                          if builtins.isList cfg.elastic.index then
+                            concatStringsSep " " cfg.elastic.index
+                          else
+                            cfg.elastic.index;
+                      in
+                        ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" ${indices}''
+                    else "irc /var/lib/twitch-archiver/twitch.log";
+                in
+                "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";
@@ -105,9 +114,6 @@
         rustc = rust-version;
         cargo = rust-version;
       };
-
-      # these are needed in both devShell and buildInputs
-      darwinDeps = with pkgs; lib.optionals stdenv.isDarwin [ ];
     in
     {
       packages = {
@@ -123,8 +129,8 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          nativeBuildInputs = [ ];
-          buildInputs = [ ] ++ darwinDeps;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.openssl ];
 
           # makes no sense in a nix package
           CARGO_INCREMENTAL = "0";
@@ -150,7 +156,9 @@
       };
       formatter = pkgs.nixpkgs-fmt;
       devShells.default = pkgs.mkShell {
-        buildInputs = with pkgs; [
+        inputsFrom = [ self.packages.${system}.twitch-archiver ];
+
+        nativeBuildInputs = with pkgs; [
           # Should be before rust?.
           (rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt))
 
@@ -169,11 +177,12 @@
           cargo-nextest
           # cargo-insta
           # cargo-deny
-        ] ++ darwinDeps;
+        ];
 
-        shellHook = ''
-          export RUST_BACKTRACE=1
-        '';
+        LD_LIBRARY_PATH = with pkgs; lib.makeLibraryPath [ openssl ];
+
+        RUSTDOCFLAGS = "-D warnings";
+        RUST_BACKTRACE = "full";
       };
     }));
 }
