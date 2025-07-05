@@ -263,6 +263,7 @@ struct Json {
     channel: Option<String>,
     name: Option<String>,
     message: Option<String>,
+    action: Option<bool>,
     tags: serde_json::Map<String, Value>,
     #[serde(rename = "irc.nick")]
     irc_nick: Option<String>,
@@ -353,6 +354,17 @@ fn to_json(message: &IRCMessage) -> Json {
                 .map(|s| s.to_owned())
         });
 
+    let (action, text) = match text
+        .as_deref()
+        .and_then(|t| t.strip_prefix("\u{0001}ACTION "))
+    {
+        Some(text) => (
+            Some(true),
+            Some(text.strip_suffix('\u{0001}').unwrap_or(text).to_owned()),
+        ),
+        None => (None, text),
+    };
+
     let (commands_count, commands_only) = (irc_cmd == "PRIVMSG")
         .then_some(text.as_deref())
         .flatten()
@@ -375,6 +387,7 @@ fn to_json(message: &IRCMessage) -> Json {
         tags,
         channel,
         message: text,
+        action,
         irc_nick,
         irc_cmd,
         irc_extras,
