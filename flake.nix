@@ -19,7 +19,18 @@
       with lib;
       let
         cfg = config.services.twitch-archiver;
-        channels = concatStringsSep " " cfg.channels;
+        channels = concatStringsSep "," cfg.channels;
+        subcmd =
+          if cfg.elastic != null then
+            let
+              indices =
+                if builtins.isList cfg.elastic.index then
+                  concatStringsSep " " cfg.elastic.index
+                else
+                  cfg.elastic.index;
+            in
+              ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" ${indices}''
+          else "irc /var/lib/twitch-archiver/twitch.log";
       in
       {
         options.services.twitch-archiver = {
@@ -66,21 +77,7 @@
             serviceConfig = {
               Restart = "on-failure";
               RestartSec = "1s";
-              ExecStart =
-                let
-                  subcmd =
-                    if cfg.elastic != null then
-                      let
-                        indices =
-                          if builtins.isList cfg.elastic.index then
-                            concatStringsSep " " cfg.elastic.index
-                          else
-                            cfg.elastic.index;
-                      in
-                        ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" ${indices}''
-                    else "irc /var/lib/twitch-archiver/twitch.log";
-                in
-                "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
+              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";

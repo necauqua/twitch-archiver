@@ -71,7 +71,7 @@ enum OutputFormat {
 #[derive(Parser)]
 struct ArchiveArgs {
     /// The channels to read from
-    #[arg(short, long)]
+    #[arg(short, long, value_delimiter = ',')]
     channels: Vec<String>,
     /// What nick to use for auth, defaults to an anonymous Twitch user
     #[arg(short, long)]
