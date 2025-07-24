@@ -20,6 +20,7 @@
       let
         cfg = config.services.twitch-archiver;
         channels = concatStringsSep "," cfg.channels;
+
         subcmd =
           if cfg.elastic != null then
             let
@@ -29,8 +30,14 @@
                 else
                   cfg.elastic.index;
             in
-              ''elastic ${cfg.elastic.url} "${cfg.elastic.apiKeyFile}" ${indices}''
+            ''elastic ${cfg.elastic.url} "%d/apikey" ${indices}''
           else "irc /var/lib/twitch-archiver/twitch.log";
+
+        load-credential =
+          if cfg.elastic != null then {
+            LoadCredential = "apikey:${cfg.elastic.apiKeyFile}";
+          } else { };
+
       in
       {
         options.services.twitch-archiver = {
@@ -81,7 +88,7 @@
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";
-            };
+            } // load-credential;
           };
         };
       };
