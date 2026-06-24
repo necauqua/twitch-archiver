@@ -245,11 +245,11 @@ fn compress(msg: &mut IRCMessage) {
     };
     msg.tags.0.retain(|k, v| {
         // client-nonce is a useless nonce that takes up 46 bytes total and display-name is redundant if equal to nick
-        if k == "client-nonce" || k == "display-name" && v.as_deref() == Some(nick) {
+        if k == "client-nonce" || k == "display-name" && v == nick {
             return false;
         }
         // otherwise just cleanup empty tags
-        !v.as_deref().is_none_or(|s| s.is_empty())
+        !v.is_empty()
     });
 }
 
@@ -285,7 +285,7 @@ fn to_json(message: &IRCMessage) -> Json {
 
     for (k, v) in &message.tags.0 {
         let k = (*k).to_owned();
-        let v = v.as_deref().unwrap_or_default();
+        let v = v.as_str();
         if k == "badges" || k == "badge-info" {
             let data = v
                 .split(",")
@@ -501,9 +501,6 @@ fn backfill(args: BackfillArgs) -> Result<()> {
 
         // fixup old logs that base64-compressed uuids like that
         for (k, v) in &mut message.tags.0 {
-            let Some(v) = v.as_mut() else {
-                continue;
-            };
             if v.len() != 36 && (*k == "reply-parent-msg-id" || *k == "reply-thread-parent-msg-id")
             {
                 *v = Uuid::from_slice(&base64::prelude::BASE64_STANDARD_NO_PAD.decode(&**v)?)?

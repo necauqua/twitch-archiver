@@ -1,25 +1,25 @@
 [package]
-name = 'twitch-archiver'
-version = '0.2.1'
-authors = ['Anton Bulakh <him@necauq.ua>']
-edition = '2021'
+name = "twitch-archiver"
+version = "0.3.0"
+authors = ["Anton Bulakh <him@necauq.ua>"]
+edition = "2021"
 
 [dependencies]
 neca-cmd = "0.3.0"
 
-anyhow = { version = '1', features = ['backtrace'] }
-base64 = '0.22'
-chrono = '0.4'
-clap = { version = '4', features = ['derive'] }
-file-rotate = '0.7'
-rustls = { version = '0.23', default-features = false, features = ['ring'] }
-serde = { version = '1', features = ['derive'] }
-serde_json = { version = '1', features = ['preserve_order'] }
-serde_with = '3'
-smallvec = '1'
-tracing = { version = '0.1', features = ['log'] }
-tracing-subscriber = { version = '0.3', features = ['env-filter'] }
-ureq = { version = '3', features = ['json'] }
-uuid = { version = '1', features = ['v4'] }
-twitch-irc = "5.0.1"
-tokio = "1.48.0"
+anyhow = { version = "1", features = ["backtrace"] }
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+file-rotate = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_with = "3"
+smallvec = "1"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
+twitch-irc = "6"
+tokio = "1"
