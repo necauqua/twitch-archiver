@@ -6,10 +6,13 @@ use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, F
 use neca_cmd::CommandMessage;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Write},
     num::NonZero,
     path::PathBuf,
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender},
+    thread::JoinHandle,
+    time::Duration,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -65,6 +68,11 @@ enum OutputFormat {
         /// channels to indices is used.
         #[arg(required = true, num_args = 1..)]
         indices: Vec<String>,
+        /// The delay (in seconds) between attempts to retry indexing messages
+        /// while ES is unavailable. Failed messages are kept in memory and
+        /// retried indefinitely so that none are lost during an outage.
+        #[arg(long, default_value = "5")]
+        retry_interval: u64,
     },
 }
 
@@ -153,14 +161,132 @@ impl<W: Write> LogOutput for JsonLogOutput<W> {
     }
 }
 
-struct ElasticLogOutput {
+/// A message waiting to be indexed into ES.
+struct PendingMessage {
+    id: String,
+    index: String,
+    body: String,
+}
+
+/// The outcome of a single indexing attempt.
+enum IndexOutcome {
+    /// The message was indexed (or is a permanent failure) and can be dropped
+    /// from the backlog.
+    Done,
+    /// A transient failure (ES unreachable or returning 5xx/429); the message
+    /// should be retried later.
+    Retry,
+}
+
+/// Attempt to index a single message into ES, classifying the result as either
+/// done (success/conflict/permanent failure) or a transient failure to retry.
+fn try_index(client: &ureq::Agent, address: &str, pending: &PendingMessage) -> IndexOutcome {
+    let endpoint = format!("{address}/{}/_create/{}", pending.index, pending.id);
+
+    let res = match client.post(&endpoint).send(&pending.body) {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::warn!(id = pending.id, "Failed to reach ES, will retry: {e}");
+            return IndexOutcome::Retry;
+        }
+    };
+
+    let status = res.status();
+    if status.is_success() {
+        return IndexOutcome::Done;
+    }
+    if status == StatusCode::CONFLICT {
+        tracing::info!(id = pending.id, "Message already exists in ES");
+        return IndexOutcome::Done;
+    }
+    tracing::warn!(
+        id = pending.id,
+        "ES returned a error (status {status}), will retry"
+    );
+    IndexOutcome::Retry
+}
+
+/// Try to index the backlog in arrival order, stopping at the first transient
+/// failure so that ordering is preserved while ES is unavailable.
+fn drain_backlog(backlog: &mut VecDeque<PendingMessage>, client: &ureq::Agent, address: &str) {
+    while let Some(front) = backlog.front() {
+        match try_index(client, address, front) {
+            IndexOutcome::Done => {
+                backlog.pop_front();
+            }
+            IndexOutcome::Retry => break,
+        }
+    }
+}
+
+/// Background worker that owns the retry backlog and indexes messages into ES.
+///
+/// Messages are indexed in arrival order; whenever ES is unavailable the
+/// affected messages stay queued and are retried every `retry_interval`,
+/// indefinitely, so none are lost during an outage. Retries are driven by a
+/// timer, independent of incoming traffic. Once the channel is closed it keeps
+/// retrying until the backlog has been fully flushed before exiting.
+fn run_worker(
     client: ureq::Agent,
     address: String,
+    rx: Receiver<PendingMessage>,
+    retry_interval: Duration,
+) {
+    let mut backlog: VecDeque<PendingMessage> = VecDeque::new();
+
+    loop {
+        // wait for the next message: block indefinitely when nothing is
+        // pending, otherwise wake up after retry_interval to retry the backlog
+        let received = if backlog.is_empty() {
+            match rx.recv() {
+                Ok(msg) => Some(msg),
+                // channel closed and nothing left to flush
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(retry_interval) {
+                Ok(msg) => Some(msg),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    // shutting down: keep retrying until the backlog is empty
+                    while !backlog.is_empty() {
+                        drain_backlog(&mut backlog, &client, &address);
+                        if backlog.is_empty() {
+                            break;
+                        }
+                        tracing::warn!(
+                            pending = backlog.len(),
+                            "ES unavailable while shutting down, retrying in {}s",
+                            retry_interval.as_secs()
+                        );
+                        std::thread::sleep(retry_interval);
+                    }
+                    return;
+                }
+            }
+        };
+
+        if let Some(pending) = received {
+            backlog.push_back(pending);
+        }
+
+        drain_backlog(&mut backlog, &client, &address);
+    }
+}
+
+struct ElasticLogOutput {
     indices: HashMap<String, String>,
+    sender: Option<Sender<PendingMessage>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl ElasticLogOutput {
-    fn new(address: &str, api_key_file: &str, indices: HashMap<String, String>) -> Self {
+    fn new(
+        address: &str,
+        api_key_file: &str,
+        indices: HashMap<String, String>,
+        retry_interval: Duration,
+    ) -> Self {
         let key = std::fs::read_to_string(api_key_file)
             .expect("Failed to read ES API key from the given file");
         let key = key.trim();
@@ -179,10 +305,17 @@ impl ElasticLogOutput {
             .build()
             .new_agent();
 
+        let (sender, rx) = std::sync::mpsc::channel();
+        let address = address.to_owned();
+        let worker = std::thread::Builder::new()
+            .name("es-indexer".into())
+            .spawn(move || run_worker(client, address, rx, retry_interval))
+            .expect("Failed to spawn ES indexer thread");
+
         Self {
-            client,
-            address: address.to_owned(),
             indices,
+            sender: Some(sender),
+            worker: Some(worker),
         }
     }
 }
@@ -199,32 +332,32 @@ impl LogOutput for ElasticLogOutput {
         let index = self
             .indices
             .get(channel)
-            .with_context(|| format!("No index mapping for channel {channel}"))?;
+            .with_context(|| format!("No index mapping for channel {channel}"))?
+            .clone();
         // ^ should never happen
 
         let id = json.id.take().unwrap();
-        let endpoint = format!("{}/{index}/_create/{id}", self.address);
-
         let body = serde_json::to_string(&json)?;
 
-        let res = self.client.post(&endpoint).send(&body)?;
-
-        if !res.status().is_success() {
-            if res.status() == StatusCode::CONFLICT {
-                tracing::info!(id, "Message already exists in ES");
-            } else {
-                tracing::error!(
-                    id,
-                    message = body,
-                    "Failed to send log to ES (status {}): {}",
-                    res.status(),
-                    res.into_body()
-                        .read_to_string()
-                        .unwrap_or_else(|_| "<failed to read response body>".into())
-                );
-            };
+        // hand the message off to the worker thread, which owns the backlog and
+        // retries; the worker lives for the lifetime of this output, so the
+        // channel only closes on drop and this send shouldn't fail
+        let sender = self.sender.as_ref().expect("sender is only taken on drop");
+        if sender.send(PendingMessage { id, index, body }).is_err() {
+            bail!("ES indexer thread has stopped unexpectedly");
         }
         Ok(())
+    }
+}
+
+impl Drop for ElasticLogOutput {
+    fn drop(&mut self) {
+        // close the channel so the worker flushes the backlog and exits, then
+        // wait for it so no buffered message is lost on shutdown
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -430,6 +563,7 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
             address,
             api_key_file,
             indices,
+            retry_interval,
         } => {
             let mapping = match &indices[..] {
                 [index] => args
@@ -448,11 +582,16 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
                             indices.len()
                         );
                     }
-                    args.channels.into_iter().zip(indices.into_iter()).collect()
+                    args.channels.into_iter().zip(indices).collect()
                 }
             };
 
-            Box::new(ElasticLogOutput::new(&address, &api_key_file, mapping))
+            Box::new(ElasticLogOutput::new(
+                &address,
+                &api_key_file,
+                mapping,
+                Duration::from_secs(retry_interval),
+            ))
         }
     };
 
