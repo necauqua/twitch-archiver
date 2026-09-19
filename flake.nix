@@ -12,9 +12,9 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }: {
-    overlays.default = (final: prev: {
-      twitch-archiver = self.packages.${final.system}.twitch-archiver;
-    });
+    overlays.default = final: _: {
+      twitch-archiver = self.packages.${final.stdenv.hostPlatform.system}.twitch-archiver;
+    };
     nixosModules.default = { config, lib, pkgs, ... }:
       with lib;
       let
@@ -105,7 +105,7 @@
       filterSrc = src: regexes:
         pkgs.lib.cleanSourceWith {
           inherit src;
-          filter = path: type:
+          filter = path: _:
             let
               relPath = pkgs.lib.removePrefix (toString src + "/") (toString path);
             in
