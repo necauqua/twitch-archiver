@@ -49,12 +49,16 @@
           DynamicUser = "yes";
         } // load-credential;
 
-        # A tag that changes whenever the effective unit changes. It gives
-        # every generation of the archiver its own unit name, so that two of
-        # them can run at the same time, and it makes the switcher below
-        # re-run on a deploy.
-        tag = builtins.substring 0 8
-          (builtins.hashString "sha256" (builtins.toJSON serviceConfig));
+        # A tag that gives every generation of the archiver its own unit name,
+        # so that two of them can run at the same time and the switcher below
+        # can tell the instance it wants from the ones it must stop.
+        #
+        # It hashes the rendered unit, which is what a switch compares as well,
+        # so it also covers what the unit gets from outside `serviceConfig`:
+        # the environment of the service and any `restartTriggers`, such as the
+        # content of the file that holds the credential.
+        tag = builtins.substring 0 8 (builtins.hashString "sha256"
+          config.systemd.units."twitch-archiver@.service".text);
 
         systemctl = "${config.systemd.package}/bin/systemctl";
       in
@@ -147,15 +151,17 @@
                 inherit serviceConfig;
               };
 
+              # The switcher holds no state and ends inactive, so every switch
+              # starts it again through multi-user.target. It reconciles rather
+              # than reacts: it makes the instance of this generation the one
+              # that runs, which is a no-op when it already does, and it also
+              # brings the archiver back if the instance died.
               twitch-archiver-switcher = {
                 description = "Cut over to twitch-archiver generation ${tag}";
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network.target" ];
 
-                serviceConfig = {
-                  Type = "oneshot";
-                  RemainAfterExit = true;
-                };
+                serviceConfig.Type = "oneshot";
 
                 # `systemctl start` of a Type=notify unit returns once the
                 # archiver reported that it joined every channel, so the old
