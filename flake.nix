@@ -82,6 +82,10 @@
             wantedBy = [ "multi-user.target" ];
             after = [ "network.target" ];
             serviceConfig = {
+              # the archiver reports readiness once it joined every channel,
+              # which lets a new instance overlap with the one it replaces
+              Type = "notify";
+              NotifyAccess = "main";
               Restart = "on-failure";
               RestartSec = "1s";
               ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";

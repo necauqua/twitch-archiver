@@ -6,9 +6,10 @@ use file_rotate::{compression::Compression, suffix::AppendCount, ContentLimit, F
 use neca_cmd::CommandMessage;
 use serde_json::Value;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     num::NonZero,
+    os::unix::net::UnixDatagram,
     path::PathBuf,
     sync::mpsc::{Receiver, RecvTimeoutError, Sender},
     thread::JoinHandle,
@@ -18,7 +19,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use twitch_irc::{
     login::StaticLoginCredentials,
-    message::{AsRawIRC, IRCMessage, IRCPrefix},
+    message::{AsRawIRC, IRCMessage, IRCPrefix, ServerMessage},
     ClientConfig, SecureTCPTransport, TwitchIRCClient,
 };
 use ureq::{
@@ -126,6 +127,10 @@ enum Args {
     Archive(ArchiveArgs),
     Backfill(BackfillArgs),
 }
+
+/// How long to wait for every channel to be joined before reporting readiness
+/// to the service manager anyway.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[rustfmt::skip]
 const IGNORED_CMDS: &[&str] = &[
@@ -539,6 +544,20 @@ fn rotate(path: &Option<PathBuf>, rotation_limit: Option<usize>) -> FileRotate<A
     )
 }
 
+/// Send `READY=1` to the service manager, as described in sd_notify(3).
+/// Does nothing when `NOTIFY_SOCKET` is unset, which is the case outside of
+/// systemd.
+fn notify_ready() {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let path = PathBuf::from(socket);
+    let result = UnixDatagram::unbound().and_then(|sock| sock.send_to(b"READY=1\n", &path));
+    if let Err(e) = result {
+        tracing::warn!("Failed to report readiness to the service manager: {e}");
+    }
+}
+
 async fn archive(mut args: ArchiveArgs) -> Result<()> {
     let (mut receiver, client) = TwitchIRCClient::<SecureTCPTransport, _>::new(
         ClientConfig::new_simple(StaticLoginCredentials::anonymous()),
@@ -547,6 +566,12 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
         channel.make_ascii_lowercase();
         client.join(channel.clone())?;
     }
+
+    // Readiness is reported only once every channel is joined, so that a
+    // replacement process can overlap with the one it replaces instead of
+    // leaving a gap in the archive.
+    let mut pending_joins: HashSet<String> = args.channels.iter().cloned().collect();
+    let join_deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
 
     let mut output: Box<dyn LogOutput> = match args.output {
         OutputFormat::Irc { file: None, .. } => Box::new(IrcLogOutput(std::io::stdout())),
@@ -595,7 +620,37 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
         }
     };
 
-    while let Some(msg) = receiver.recv().await {
+    loop {
+        let msg = if pending_joins.is_empty() {
+            match receiver.recv().await {
+                Some(msg) => msg,
+                None => break,
+            }
+        } else {
+            tokio::select! {
+                msg = receiver.recv() => match msg {
+                    Some(msg) => msg,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(join_deadline) => {
+                    tracing::warn!(
+                        channels = ?pending_joins,
+                        "Not all channels were joined in time, reporting readiness anyway",
+                    );
+                    pending_joins.clear();
+                    notify_ready();
+                    continue;
+                }
+            }
+        };
+
+        if let ServerMessage::Join(join) = &msg {
+            if pending_joins.remove(&join.channel_login) && pending_joins.is_empty() {
+                tracing::info!("Joined all channels");
+                notify_ready();
+            }
+        }
+
         let mut msg = msg.source().clone();
         if args.dont_filter || !IGNORED_CMDS.contains(&&*msg.command) {
             compress(&mut msg);
