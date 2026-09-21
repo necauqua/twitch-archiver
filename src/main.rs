@@ -897,7 +897,10 @@ fn backfill(args: BackfillArgs) -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // the log goes to stderr, because stdout carries the archived messages
+    // when no output file is given
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
