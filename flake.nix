@@ -48,6 +48,16 @@
             description = "A list of channels to connect to and archive";
             type = types.listOf types.str;
           };
+          connections = mkOption {
+            description = ''
+              How many independent connections to Twitch to keep open.
+              Every connection archives every channel and the messages are
+              deduplicated, so that a RECONNECT request or a connection loss
+              does not lose messages.
+            '';
+            type = types.ints.positive;
+            default = 2;
+          };
           rotationLimit = mkOption {
             description = "";
             type = types.number;
@@ -88,7 +98,7 @@
               NotifyAccess = "main";
               Restart = "on-failure";
               RestartSec = "1s";
-              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} ${subcmd}";
+              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} --connections ${toString cfg.connections} ${subcmd}";
               DynamicUser = "yes";
               StateDirectory = "twitch-archiver";
               StateDirectoryMode = "0755";

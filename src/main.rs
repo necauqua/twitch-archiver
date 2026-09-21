@@ -7,13 +7,15 @@ use neca_cmd::CommandMessage;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Write as _,
     io::{BufRead, BufReader, Write},
     num::NonZero,
     os::unix::net::UnixDatagram,
     path::PathBuf,
+    rc::Rc,
     sync::mpsc::{Receiver, RecvTimeoutError, Sender},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -94,6 +96,18 @@ struct ArchiveArgs {
     /// away
     #[arg(long)]
     dont_filter: bool,
+    /// How many independent connections to Twitch to keep open.
+    /// Every connection joins every channel and gets the same messages, which
+    /// are then deduplicated. More than one connection means that a RECONNECT
+    /// request (or any other connection loss) does not lose messages, because
+    /// the other connections keep receiving while the failed one comes back.
+    #[arg(long, default_value = "2")]
+    connections: usize,
+    /// How long (in seconds) to remember a message for deduplication.
+    /// A message that was not delivered by every connection inside this window
+    /// is reported as missed.
+    #[arg(long, default_value = "30")]
+    dedup_window: u64,
     /// The file to write logs to, will be rotated and compressed.
     /// By default logs are just printed to stdout.
     /// If no name is given the file will be called twitch.log
@@ -131,6 +145,10 @@ enum Args {
 /// How long to wait for every channel to be joined before reporting readiness
 /// to the service manager anyway.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The largest number of connections that fits in the bitmask of the
+/// deduplicator.
+const MAX_CONNECTIONS: usize = u32::BITS as usize;
 
 #[rustfmt::skip]
 const IGNORED_CMDS: &[&str] = &[
@@ -558,19 +576,151 @@ fn notify_ready() {
     }
 }
 
-async fn archive(mut args: ArchiveArgs) -> Result<()> {
-    let (mut receiver, client) = TwitchIRCClient::<SecureTCPTransport, _>::new(
-        ClientConfig::new_simple(StaticLoginCredentials::anonymous()),
-    );
-    for channel in &mut args.channels {
-        channel.make_ascii_lowercase();
-        client.join(channel.clone())?;
+/// The key that identifies a message across the connections.
+///
+/// Twitch gives every chat message a unique id, which is used when present.
+/// The other messages are identified by their content: the tags are sorted,
+/// because they are stored in a hash map and so their raw form has no stable
+/// order.
+fn dedup_key(msg: &IRCMessage) -> String {
+    if let Some(id) = msg.tags.0.get("id") {
+        return id.clone();
+    }
+    let mut tags = msg.tags.0.iter().collect::<Vec<_>>();
+    tags.sort_unstable();
+
+    let mut key = String::new();
+    for (k, v) in tags {
+        let _ = write!(key, "@{k}={v}");
+    }
+    if let Some(prefix) = &msg.prefix {
+        let _ = write!(key, " :{}", prefix.as_raw_irc());
+    }
+    let _ = write!(key, " {}", msg.command);
+    for param in &msg.params {
+        let _ = write!(key, " {param}");
+    }
+    key
+}
+
+/// Keeps track of which connections delivered each message, so that a message
+/// received over several connections is written out exactly once, and a
+/// connection that misses messages is reported.
+struct Dedup {
+    /// How many connections are expected to deliver every message.
+    connections: usize,
+    /// How long a message is remembered before it is reported and dropped.
+    window: Duration,
+    /// Key of every remembered message, with a bitmask of the connections that
+    /// delivered it.
+    seen: HashMap<Rc<str>, u32>,
+    /// The same keys in arrival order, with the time they first arrived.
+    order: VecDeque<(Instant, Rc<str>)>,
+}
+
+impl Dedup {
+    fn new(connections: usize, window: Duration) -> Self {
+        Self {
+            connections,
+            window,
+            seen: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
-    // Readiness is reported only once every channel is joined, so that a
-    // replacement process can overlap with the one it replaces instead of
-    // leaving a gap in the archive.
-    let mut pending_joins: HashSet<String> = args.channels.iter().cloned().collect();
+    /// Record that `connection` delivered the message with the given key.
+    /// Returns true when this is the first connection to deliver it, which is
+    /// when the message has to be written out.
+    fn observe(&mut self, connection: usize, key: &str) -> bool {
+        let mask = 1 << connection;
+        if let Some(seen) = self.seen.get_mut(key) {
+            *seen |= mask;
+            return false;
+        }
+        let key: Rc<str> = Rc::from(key);
+        self.seen.insert(Rc::clone(&key), mask);
+        self.order.push_back((Instant::now(), key));
+        true
+    }
+
+    /// Drop every message that is older than the window, reporting the ones
+    /// that were not delivered by all of the connections.
+    fn expire(&mut self) {
+        while let Some((arrived, _)) = self.order.front() {
+            if arrived.elapsed() < self.window {
+                break;
+            }
+            let (_, key) = self.order.pop_front().unwrap();
+            let seen = self.seen.remove(&key).unwrap_or(0);
+            if seen.count_ones() as usize == self.connections {
+                continue;
+            }
+            let missing = (0..self.connections)
+                .filter(|c| seen & (1 << c) == 0)
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                ?missing,
+                seen = seen.count_ones(),
+                of = self.connections,
+                "Message was not delivered by every connection: {key}",
+            );
+        }
+    }
+}
+
+async fn archive(mut args: ArchiveArgs) -> Result<()> {
+    if !(1..=MAX_CONNECTIONS).contains(&args.connections) {
+        bail!(
+            "Expected 1 to {MAX_CONNECTIONS} connections, got {}",
+            args.connections
+        );
+    }
+    for channel in &mut args.channels {
+        channel.make_ascii_lowercase();
+    }
+
+    // Every connection is fully independent and joins every channel, so that
+    // the messages of one connection cover the downtime of another one, for
+    // example while it obeys a RECONNECT request from Twitch.
+    // Their messages are merged into one stream, tagged with the index of the
+    // connection they came from.
+    let (merged_tx, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut clients = Vec::with_capacity(args.connections);
+    for connection in 0..args.connections {
+        let mut config = ClientConfig::new_simple(StaticLoginCredentials::anonymous());
+        config.tracing_identifier = Some(format!("connection-{connection}").into());
+
+        let (mut incoming, client) = TwitchIRCClient::<SecureTCPTransport, _>::new(config);
+        for channel in &args.channels {
+            client.join(channel.clone())?;
+        }
+
+        let merged_tx = merged_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = incoming.recv().await {
+                if merged_tx.send((connection, msg)).is_err() {
+                    break;
+                }
+            }
+        });
+        clients.push(client);
+    }
+    // only the forwarding tasks keep the stream open now
+    drop(merged_tx);
+
+    let dedup_window = Duration::from_secs(args.dedup_window);
+    let mut dedup = Dedup::new(args.connections, dedup_window);
+    // expiry is driven by a timer, so that a missed message is reported even
+    // when no other message arrives after it
+    let mut expire_interval = tokio::time::interval((dedup_window / 2).max(Duration::from_secs(1)));
+    expire_interval.tick().await; // the first tick is immediate
+
+    // Readiness is reported only once every channel is joined on every
+    // connection, so that a replacement process can overlap with the one it
+    // replaces instead of leaving a gap in the archive.
+    let mut pending_joins: HashSet<(usize, String)> = (0..args.connections)
+        .flat_map(|connection| args.channels.iter().map(move |ch| (connection, ch.clone())))
+        .collect();
     let join_deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
 
     let mut output: Box<dyn LogOutput> = match args.output {
@@ -621,42 +771,50 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
     };
 
     loop {
-        let msg = if pending_joins.is_empty() {
-            match receiver.recv().await {
+        let (connection, msg) = tokio::select! {
+            msg = receiver.recv() => match msg {
                 Some(msg) => msg,
                 None => break,
+            },
+            _ = expire_interval.tick() => {
+                dedup.expire();
+                continue;
             }
-        } else {
-            tokio::select! {
-                msg = receiver.recv() => match msg {
-                    Some(msg) => msg,
-                    None => break,
-                },
-                _ = tokio::time::sleep_until(join_deadline) => {
-                    tracing::warn!(
-                        channels = ?pending_joins,
-                        "Not all channels were joined in time, reporting readiness anyway",
-                    );
-                    pending_joins.clear();
-                    notify_ready();
-                    continue;
-                }
+            _ = tokio::time::sleep_until(join_deadline), if !pending_joins.is_empty() => {
+                tracing::warn!(
+                    channels = ?pending_joins,
+                    "Not all channels were joined in time, reporting readiness anyway",
+                );
+                pending_joins.clear();
+                notify_ready();
+                continue;
             }
         };
 
         if let ServerMessage::Join(join) = &msg {
-            if pending_joins.remove(&join.channel_login) && pending_joins.is_empty() {
-                tracing::info!("Joined all channels");
+            let joined = (connection, join.channel_login.clone());
+            if pending_joins.remove(&joined) && pending_joins.is_empty() {
+                tracing::info!("Joined all channels on all connections");
                 notify_ready();
             }
         }
 
-        let mut msg = msg.source().clone();
-        if args.dont_filter || !IGNORED_CMDS.contains(&&*msg.command) {
-            compress(&mut msg);
-            output.write(&msg)?;
+        let msg = msg.source();
+        if !args.dont_filter && IGNORED_CMDS.contains(&&*msg.command) {
+            continue;
         }
+
+        if !dedup.observe(connection, &dedup_key(msg)) {
+            continue;
+        }
+
+        let mut msg = msg.clone();
+        compress(&mut msg);
+        output.write(&msg)?;
     }
+
+    // the connections are only closed when their handles are dropped
+    drop(clients);
 
     Ok(())
 }
