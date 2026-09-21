@@ -38,6 +38,25 @@
             LoadCredential = "apikey:${cfg.elastic.apiKeyFile}";
           } else { };
 
+        serviceConfig = {
+          # the archiver reports readiness once it joined every channel,
+          # which lets a new instance overlap with the one it replaces
+          Type = "notify";
+          NotifyAccess = "main";
+          Restart = "on-failure";
+          RestartSec = "1s";
+          ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} --connections ${toString cfg.connections} ${subcmd}";
+          DynamicUser = "yes";
+        } // load-credential;
+
+        # A tag that changes whenever the effective unit changes. It gives
+        # every generation of the archiver its own unit name, so that two of
+        # them can run at the same time, and it makes the switcher below
+        # re-run on a deploy.
+        tag = builtins.substring 0 8
+          (builtins.hashString "sha256" (builtins.toJSON serviceConfig));
+
+        systemctl = "${config.systemd.package}/bin/systemctl";
       in
       {
         options.services.twitch-archiver = {
@@ -57,6 +76,24 @@
             '';
             type = types.ints.positive;
             default = 2;
+          };
+          overlap = mkOption {
+            description = ''
+              Overlap the instances of the archiver across a switch.
+
+              A plain restart drops every message that arrives while the new
+              process connects to Twitch and joins the channels. Instead one
+              instance of a template unit runs per generation: a switch starts
+              the new instance, waits for it to join all the channels, and only
+              then stops the old one.
+
+              Both instances hear the same messages for a moment, so this needs
+              an output that deduplicates them, which the ElasticSearch one
+              does on the message id.
+            '';
+            type = types.bool;
+            default = cfg.elastic != null;
+            defaultText = literalExpression "config.services.twitch-archiver.elastic != null";
           };
           rotationLimit = mkOption {
             description = "";
@@ -88,22 +125,68 @@
 
         config = {
           nixpkgs.overlays = [ self.overlays.default ];
-          systemd.services.twitch-archiver = mkIf cfg.enable {
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network.target" ];
-            serviceConfig = {
-              # the archiver reports readiness once it joined every channel,
-              # which lets a new instance overlap with the one it replaces
-              Type = "notify";
-              NotifyAccess = "main";
-              Restart = "on-failure";
-              RestartSec = "1s";
-              ExecStart = "${pkgs.twitch-archiver}/bin/twitch-archiver archive -c ${channels} --connections ${toString cfg.connections} ${subcmd}";
-              DynamicUser = "yes";
-              StateDirectory = "twitch-archiver";
-              StateDirectoryMode = "0755";
-            } // load-credential;
-          };
+
+          assertions = [{
+            assertion = cfg.enable -> cfg.overlap -> cfg.elastic != null;
+            message = ''
+              services.twitch-archiver.overlap needs an output that
+              deduplicates messages, so it needs services.twitch-archiver.elastic.
+            '';
+          }];
+
+          systemd.services = mkIf cfg.enable (
+            if cfg.overlap then {
+              "twitch-archiver@" = {
+                description = "Twitch chat archiver, generation %i";
+                after = [ "network.target" ];
+
+                # a switch must never touch a live instance, the switcher
+                # below does the cutover
+                restartIfChanged = false;
+
+                inherit serviceConfig;
+              };
+
+              twitch-archiver-switcher = {
+                description = "Cut over to twitch-archiver generation ${tag}";
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+
+                serviceConfig = {
+                  Type = "oneshot";
+                  RemainAfterExit = true;
+                };
+
+                # `systemctl start` of a Type=notify unit returns once the
+                # archiver reported that it joined every channel, so the old
+                # instance is stopped only after the new one hears everything
+                # the old one does
+                script = ''
+                  new=twitch-archiver@${tag}.service
+
+                  echo "Starting new instance $new"
+                  ${systemctl} start "$new"
+                  echo "New instance $new is ready"
+
+                  for u in $(${systemctl} list-units --plain --no-legend --state=active,activating 'twitch-archiver@*.service' | cut -d' ' -f1); do
+                    if [ "$u" != "$new" ]; then
+                      echo "Stopping previous instance $u"
+                      ${systemctl} stop "$u"
+                    fi
+                  done
+                '';
+              };
+            } else {
+              twitch-archiver = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network.target" ];
+                serviceConfig = serviceConfig // {
+                  StateDirectory = "twitch-archiver";
+                  StateDirectoryMode = "0755";
+                };
+              };
+            }
+          );
         };
       };
   } //
