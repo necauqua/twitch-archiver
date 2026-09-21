@@ -84,12 +84,13 @@ struct ArchiveArgs {
     /// The channels to read from
     #[arg(short, long, value_delimiter = ',')]
     channels: Vec<String>,
-    /// What nick to use for auth, defaults to an anonymous Twitch user
+    /// What nick to use for auth, defaults to an anonymous Twitch user.
+    /// Every connection logs in with it.
     #[arg(short, long)]
     nick: Option<String>,
-    /// Whas password to use for auth, Twitch accepts the string
-    /// "oauth:$OAUTH_TOKEN" here
-    #[arg(short, long)]
+    /// What password to use for auth, an OAuth token with or without the
+    /// "oauth:" prefix. Needs a nick to go with it.
+    #[arg(short, long, requires = "nick")]
     pass: Option<String>,
     /// Dont filter out any messages (except PING).
     /// By default, Twitch server welcome messages and JOIN/PART are filtered
@@ -679,6 +680,17 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
         channel.make_ascii_lowercase();
     }
 
+    let credentials = match &args.nick {
+        // the library adds the "oauth:" prefix itself
+        Some(nick) => StaticLoginCredentials::new(
+            nick.clone(),
+            args.pass
+                .as_deref()
+                .map(|pass| pass.strip_prefix("oauth:").unwrap_or(pass).to_owned()),
+        ),
+        None => StaticLoginCredentials::anonymous(),
+    };
+
     // Every connection is fully independent and joins every channel, so that
     // the messages of one connection cover the downtime of another one, for
     // example while it obeys a RECONNECT request from Twitch.
@@ -687,7 +699,7 @@ async fn archive(mut args: ArchiveArgs) -> Result<()> {
     let (merged_tx, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut clients = Vec::with_capacity(args.connections);
     for connection in 0..args.connections {
-        let mut config = ClientConfig::new_simple(StaticLoginCredentials::anonymous());
+        let mut config = ClientConfig::new_simple(credentials.clone());
         config.tracing_identifier = Some(format!("connection-{connection}").into());
 
         let (mut incoming, client) = TwitchIRCClient::<SecureTCPTransport, _>::new(config);
